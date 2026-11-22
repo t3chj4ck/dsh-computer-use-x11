@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "X11 电脑操作",
+    "description": "给 agent 一个 cua 工具来操作本机 X11 桌面：列出窗口、读无障碍树、截取窗口、派发点击/按键/文本。只支持 Linux X11，依赖 xdotool 与 maim，无障碍走 AT-SPI2。",
+    "detail": "docs/DETAIL.md"
+  }
+}

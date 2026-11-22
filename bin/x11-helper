@@ -1,0 +1,1502 @@
+#!/usr/bin/env python3
+"""DeepSeek Harness Computer Use helper for X11.
+
+Speaks the dsh-cua native protocol as newline-delimited JSON: one request per
+line on stdin, one reply per line on stdout, strictly one request in flight.
+
+Sources of truth on an X11 session:
+  * window list and geometry  -> xprop / xwininfo (EWMH)
+  * accessibility tree        -> AT-SPI2 over D-Bus (pyatspi via gi)
+  * pointer and keyboard      -> XTest through xdotool
+  * captures                  -> maim with an ImageMagick import fallback
+
+No DSH imports: this file only needs python3 plus the tools above.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+PROTOCOL_VERSION = 1
+METHODS = [
+    "activate", "click", "drag", "findApps", "getApp", "getCapabilities",
+    "getState", "invoke", "listActions", "listApps", "listWindows", "mouseMove",
+    "paste", "performAction", "pressKey", "screenshot", "scroll", "selectText",
+    "sendKeyEvent", "setValue", "show", "typeText",
+]
+
+TEXT_DELAY_MS = int(os.environ.get("DSH_X11_TEXT_DELAY_MS", "5"))
+AX_BUDGET_MS = int(os.environ.get("DSH_X11_AX_BUDGET_MS", "4000"))
+CAPTURE_DIR = tempfile.mkdtemp(prefix="dsh-x11-cua-")
+
+DESKTOP_DIRS = [
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    os.path.expanduser("~/.local/share/applications"),
+    "/var/lib/flatpak/exports/share/applications",
+    os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+]
+
+
+class HelperError(Exception):
+    """A refusal reported to the Host with a stable machine-readable code."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# --------------------------------------------------------------------------
+# process helpers
+# --------------------------------------------------------------------------
+
+def run(argv, stdin_data=None, timeout=8.0):
+    try:
+        proc = subprocess.run(
+            argv, input=stdin_data, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise HelperError("NATIVE_UNAVAILABLE", f"{argv[0]} is not installed")
+    except subprocess.TimeoutExpired:
+        raise HelperError("NATIVE_TIMEOUT", f"{argv[0]} exceeded {timeout:g}s")
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:400]
+        raise HelperError("NATIVE_FAILURE", f"{argv[0]} exited {proc.returncode}: {detail}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def xdo(*args, timeout=8.0):
+    return run(["xdotool", *[str(a) for a in args]], timeout=timeout)
+
+
+def has_binary(name):
+    return shutil.which(name) is not None
+
+
+def unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
+
+
+# --------------------------------------------------------------------------
+# X11 window model
+# --------------------------------------------------------------------------
+
+_INDEX = {"at": 0.0, "windows": {}}
+_PROPS = {}
+_INDEX_TTL = 0.4
+_PROP_TTL = 1.0
+_TREE_LINE = re.compile(
+    r'^\s+(0x[0-9a-fA-F]+) (".*?"): \("([^"]*)" "([^"]*)"\)\s+'
+    r'(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\s+\+(-?\d+)\+(-?\d+)'
+)
+
+
+def x_property_root(name):
+    text = run(["xprop", "-root", name])
+    if "not found" in text:
+        return ""
+    # xprop prints `NAME(TYPE) = value` for atoms and `NAME(TYPE): value` for lists.
+    if "=" in text:
+        return text.split("=", 1)[1].strip()
+    if ":" in text:
+        return text.split(":", 1)[1].strip()
+    return ""
+
+
+def window_ids_from_root(name):
+    raw = x_property_root(name)
+    return [int(token, 16) for token in re.findall(r"0x[0-9a-fA-F]+", raw)]
+
+
+def window_index(force=False):
+    now = time.monotonic()
+    if not force and _INDEX["windows"] and now - _INDEX["at"] < _INDEX_TTL:
+        return _INDEX["windows"]
+    text = run(["xwininfo", "-root", "-tree"], timeout=6.0)
+    windows = {}
+    for line in text.splitlines():
+        match = _TREE_LINE.match(line)
+        if match is None:
+            continue
+        window_id = int(match.group(1), 16)
+        windows[window_id] = {
+            "windowId": window_id,
+            "title": unquote(match.group(2)),
+            "instance": match.group(3),
+            "className": match.group(4),
+            "width": int(match.group(5)),
+            "height": int(match.group(6)),
+            "x": int(match.group(9)),
+            "y": int(match.group(10)),
+        }
+    _INDEX["windows"] = windows
+    _INDEX["at"] = now
+    return windows
+
+
+def window_props(window_id):
+    now = time.monotonic()
+    hit = _PROPS.get(window_id)
+    if hit is not None and now - hit[0] < _PROP_TTL:
+        return hit[1]
+    text = run(["xprop", "-id", hex(window_id), "_NET_WM_PID", "_NET_WM_STATE", "_NET_WM_NAME", "WM_NAME"])
+    props = {"pid": None, "hidden": False, "name": ""}
+    for line in text.splitlines():
+        if line.startswith("_NET_WM_PID"):
+            tail = line.split("=", 1)[1] if "=" in line else ""
+            digits = re.findall(r"\d+", tail)
+            if digits:
+                props["pid"] = int(digits[0])
+        elif line.startswith("_NET_WM_STATE"):
+            props["hidden"] = "_NET_WM_STATE_HIDDEN" in line
+        elif line.startswith("_NET_WM_NAME") and "=" in line:
+            props["name"] = unquote(line.split("=", 1)[1])
+        elif line.startswith("WM_NAME") and "=" in line and not props["name"]:
+            props["name"] = unquote(line.split("=", 1)[1])
+    _PROPS[window_id] = (now, props)
+    return props
+
+
+def managed_window_ids():
+    ids = window_ids_from_root("_NET_CLIENT_LIST")
+    if ids:
+        return ids
+    # No EWMH window manager: fall back to direct children of the root window.
+    return [wid for wid in window_index(force=True)]
+
+
+def window_record(window_id):
+    index = window_index()
+    entry = index.get(window_id)
+    if entry is None:
+        return None
+    props = window_props(window_id)
+    title = props["name"] or entry["title"]
+    return {
+        "windowId": window_id,
+        "appName": (entry.get("instance") or entry.get("className") or "application"),
+        "title": title,
+        "bounds": {
+            "x": entry["x"], "y": entry["y"],
+            "width": entry["width"], "height": entry["height"],
+        },
+        "isOnScreen": not props["hidden"],
+        "onCurrentSpace": None,
+        "_pid": props["pid"],
+        "_entry": entry,
+    }
+
+
+def window_app_name(pid, entry):
+    if pid is not None:
+        try:
+            return Path(f"/proc/{pid}/comm").read_text().strip()
+        except OSError:
+            pass
+    return entry["instance"] or entry["className"] or "application"
+
+
+def active_window_id():
+    ids = window_ids_from_root("_NET_ACTIVE_WINDOW")
+    return ids[0] if ids else None
+
+
+def session_locked():
+    session_id = os.environ.get("XDG_SESSION_ID")
+    if not session_id:
+        return None
+    try:
+        out = run(["loginctl", "show-session", session_id, "-p", "LockedHint"], timeout=4.0)
+    except HelperError:
+        return None
+    if "LockedHint=yes" in out:
+        return True
+    if "LockedHint=no" in out:
+        return False
+    return None
+
+
+def public_window(record):
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
+# --------------------------------------------------------------------------
+# application model
+# --------------------------------------------------------------------------
+
+_HANDLES = {}   # appHandle -> {pid, name, exe, desktop}
+_PENDING = {}   # appHandle -> desktop entry awaiting launch
+
+
+def readlink(path):
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def process_exe(pid):
+    target = readlink(f"/proc/{pid}/exe")
+    if target is not None:
+        return target
+    return None
+
+
+def application_identity(name, exe):
+    material = f"x11:{exe or name}"
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def authorization(name, exe):
+    payload = {"id": application_identity(name, exe), "name": name, "persistable": True}
+    if exe is not None:
+        payload["executablePath"] = exe
+    return payload
+
+
+def desktop_entries():
+    entries = []
+    seen = set()
+    for directory in DESKTOP_DIRS:
+        base = Path(directory)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.glob("*.desktop")):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            entry = parse_desktop_entry(text)
+            if entry is None:
+                continue
+            entries.append({
+                "id": path.name[:-len(".desktop")],
+                "displayName": entry["Name"],
+                "path": str(path),
+                "exec": entry["Exec"],
+                "icon": entry.get("Icon", ""),
+            })
+    return entries
+
+
+def parse_desktop_entry(text):
+    in_section = False
+    fields = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_section = line == "[Desktop Entry]"
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in ("Name", "Exec", "Icon", "NoDisplay", "Type", "Terminal") and key not in fields:
+            fields[key] = value
+    if fields.get("Type", "Application") != "Application":
+        return None
+    if fields.get("NoDisplay", "").lower() == "true":
+        return None
+    if not fields.get("Name") or not fields.get("Exec"):
+        return None
+    return fields
+
+
+def exec_program(command):
+    parts = command.split()
+    for part in parts:
+        if part.startswith("%"):
+            continue
+        return part
+    return None
+
+
+def normalize_label(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def application_groups():
+    """Group managed windows by WM_CLASS instance.
+
+    A pid alone cannot identify an application here: processes started inside a
+    sandbox report a namespace-local `_NET_WM_PID`, so several applications can
+    share one pid. The window class stays stable.
+    """
+    index = window_index()
+    groups = {}
+    for window_id in managed_window_ids():
+        entry = index.get(window_id)
+        if entry is None:
+            continue
+        label = (entry.get("instance") or entry.get("className") or "").strip()
+        if not label:
+            continue
+        key = normalize_label(label) or f"w{window_id}"
+        group = groups.setdefault(key, {
+            "key": key, "label": label,
+            "className": entry.get("className", ""),
+            "pid": None, "windows": [], "title": "",
+        })
+        props = window_props(window_id)
+        pid = props["pid"]
+        if pid is not None and (group["pid"] is None or group["pid"] <= 2):
+            group["pid"] = pid
+        group["windows"].append(window_id)
+        title = props["name"] or entry.get("title", "")
+        if title and not group["title"]:
+            group["title"] = title
+    return groups
+
+
+def group_exe(group):
+    pid = group.get("pid")
+    if pid is None or pid <= 2:
+        return None
+    return process_exe(pid)
+
+
+def group_name(group):
+    return group["label"] or group["className"] or "application"
+
+
+def list_apps():
+    apps = []
+    for group in sorted(application_groups().values(), key=lambda item: item["label"].lower()):
+        pid = group["pid"]
+        if pid is None or pid <= 0:
+            continue
+        record = {"pid": pid, "name": group_name(group)}
+        exe = group_exe(group)
+        if exe:
+            record["bundleId"] = exe
+        apps.append(record)
+    return apps
+
+
+def find_apps(query, max_matches):
+    needle = query.strip().lower()
+    groups = application_groups()
+    by_program = {}
+    for group in groups.values():
+        exe = group_exe(group)
+        if exe:
+            by_program.setdefault(os.path.basename(exe).lower(), group)
+        for label in (group["label"], group["className"]):
+            if label:
+                by_program.setdefault(normalize_label(label), group)
+    matches = []
+    for desktop in desktop_entries():
+        program = exec_program(desktop["exec"])
+        basename = os.path.basename(program or "").lower()
+        haystack = f"{desktop['displayName']} {desktop['id']} {basename}".lower()
+        if needle and needle not in haystack:
+            continue
+        record = {
+            "id": desktop["id"],
+            "displayName": desktop["displayName"],
+            "path": desktop["path"],
+            "isRunning": False,
+        }
+        group = by_program.get(basename) or by_program.get(normalize_label(desktop["id"]))
+        if group is not None and group["pid"]:
+            record["isRunning"] = True
+            record["pid"] = group["pid"]
+        matches.append(record)
+        if len(matches) >= max_matches:
+            break
+    return matches
+
+
+def resolve_selector(selector):
+    selector = selector.strip()
+    if selector in _HANDLES:
+        return _HANDLES[selector]
+    if selector in _PENDING:
+        return {"pending": _PENDING[selector]}
+    groups = application_groups()
+    if selector.isdigit():
+        pid = int(selector)
+        hits = [group for group in groups.values() if group["pid"] == pid]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            listing = ", ".join(group_name(group) for group in hits[:8])
+            raise HelperError("AMBIGUOUS_APP", f"pid {pid} owns several window classes ({listing}); select by name")
+        raise HelperError("APP_NOT_FOUND", f"No application has pid {pid}; call listApps first")
+    wanted = normalize_label(selector)
+    exact = [group for group in groups.values()
+             if normalize_label(group["label"]) == wanted or normalize_label(group["className"]) == wanted]
+    loose = [group for group in groups.values()
+             if wanted and (wanted in normalize_label(group["label"])
+                            or wanted in normalize_label(group["className"])
+                            or wanted in normalize_label(group["title"]))]
+    candidates = exact or loose
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        listing = ", ".join(group_name(group) for group in candidates[:8])
+        raise HelperError("AMBIGUOUS_APP", f"Selector '{selector}' matches {listing}; select an exact name")
+    for desktop in desktop_entries():
+        if desktop["id"].lower() == selector.lower() or desktop["displayName"].lower() == selector.lower():
+            return {"pending": desktop}
+    raise HelperError("APP_NOT_FOUND", f"No application matches '{selector}'; use findApps first")
+
+
+def remember_group(handle, group):
+    _HANDLES[handle] = {
+        "key": group["key"], "label": group["label"],
+        "className": group.get("className", ""),
+        "pid": group.get("pid"), "name": group_name(group),
+        "exe": group_exe(group),
+    }
+    return _HANDLES[handle]
+
+
+def get_app(params):
+    resolved = resolve_selector(params["selector"])
+    if "pending" in resolved:
+        desktop = resolved["pending"]
+        handle = f"x11-pending:{desktop['id']}"
+        _PENDING[handle] = desktop
+        program = exec_program(desktop["exec"])
+        exe = shutil.which(program) if program else None
+        return {
+            "appHandle": handle,
+            "name": desktop["displayName"],
+            "running": False,
+            "authorization": authorization(desktop["displayName"], exe),
+        }
+    group = resolved
+    handle = f"x11:{group['pid'] or 0}:{group['key']}"
+    record = remember_group(handle, group)
+    return {
+        "appHandle": handle,
+        "name": record["name"],
+        "running": True,
+        "authorization": authorization(record["name"], record["exe"]),
+    }
+
+
+def launch_app(params):
+    handle = params["appHandle"]
+    pending = _PENDING.pop(handle, None)
+    record = _HANDLES.get(handle)
+    if pending is None:
+        if record is None:
+            raise HelperError("STALE_APP", "Application selection expired; call getApp again")
+        return {"appHandle": handle, "name": record["name"], "running": True}
+    before = set(managed_window_ids())
+    program = exec_program(pending["exec"])
+    binary = shutil.which(program) if program else None
+    launched = False
+    try:
+        run(["gtk-launch", pending["id"]], timeout=6.0)
+        launched = True
+    except HelperError:
+        if binary is None:
+            raise HelperError("LAUNCH_FAILED", f"Cannot launch {pending['displayName']}: {pending['exec']}")
+        subprocess.Popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        launched = True
+    if not launched:
+        raise HelperError("LAUNCH_FAILED", f"{pending['displayName']} did not start")
+    deadline = time.monotonic() + 8.0
+    group = None
+    while time.monotonic() < deadline:
+        time.sleep(0.3)
+        for candidate in application_groups().values():
+            if candidate["windows"] and candidate["windows"][0] not in before:
+                group = candidate
+                break
+        if group is not None:
+            break
+    if group is None:
+        raise HelperError("LAUNCH_TIMEOUT", f"{pending['displayName']} did not open a window within 8s")
+    remember_group(handle, group)
+    return {"appHandle": handle, "name": group_name(group), "running": True}
+
+
+def require_handle(params):
+    handle = params["appHandle"]
+    record = _HANDLES.get(handle)
+    if record is None:
+        raise HelperError("APP_ACCESS_REQUIRED", "Select the application with getApp before using this handle")
+    return handle, record
+
+
+def windows_of(record):
+    records = []
+    for window_id in managed_window_ids():
+        entry = window_index().get(window_id)
+        if entry is None:
+            continue
+        label = normalize_label(entry.get("instance") or entry.get("className"))
+        matched = label == record["key"]
+        pid = record.get("pid")
+        if not matched and pid is not None and pid > 2:
+            matched = window_props(window_id)["pid"] == pid
+        if not matched:
+            continue
+        window = window_record(window_id)
+        if window is not None:
+            records.append(window)
+    return records
+
+
+def find_window(handle, window_id=None):
+    _, record = require_handle({"appHandle": handle})
+    windows = windows_of(record)
+    if window_id is None:
+        focused = active_window_id()
+        for window in windows:
+            if window["windowId"] == focused:
+                return window
+        if not windows:
+            raise HelperError("WINDOW_NOT_FOUND", "The application has no managed window")
+        return windows[0]
+    for window in windows:
+        if window["windowId"] == window_id:
+            return window
+    raise HelperError("WINDOW_NOT_FOUND", f"Window {window_id} does not belong to this application")
+
+
+def list_windows(params):
+    handle, record = require_handle(params)
+    return [public_window(window) for window in windows_of(record)]
+
+
+# --------------------------------------------------------------------------
+# AT-SPI accessibility
+# --------------------------------------------------------------------------
+
+_ATSPI = None
+_ATSPI_FAILURE = None
+_AT_APPS = {"at": 0.0, "apps": []}
+_FRAME_ROLES = {"frame", "window", "dialog", "alert", "file chooser", "popup menu", "menu"}
+
+
+def ensure_accessibility_enabled():
+    """Ask at-spi2-core to expose UI trees; toolkits read this status at startup."""
+    if os.environ.get("DSH_X11_ENABLE_A11Y", "1") == "0" or os.environ.get("DSH_X11_A11Y_CHECKED"):
+        return
+    os.environ["DSH_X11_A11Y_CHECKED"] = "1"
+    try:
+        state = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.a11y.Bus", "--object-path", "/org/a11y/bus",
+             "--method", "org.freedesktop.DBus.Properties.Get", "org.a11y.Status", "IsEnabled"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4.0).stdout
+        if b"true" in state:
+            return
+        subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.a11y.Bus", "--object-path", "/org/a11y/bus",
+             "--method", "org.freedesktop.DBus.Properties.Set", "org.a11y.Status", "IsEnabled", "<true>"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4.0)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def atspi():
+    global _ATSPI, _ATSPI_FAILURE
+    if _ATSPI is not None:
+        return _ATSPI
+    if _ATSPI_FAILURE is not None:
+        raise HelperError("ACCESSIBILITY_UNAVAILABLE", _ATSPI_FAILURE)
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        Atspi.get_desktop(0)
+        ensure_accessibility_enabled()
+    except Exception as exc:  # noqa: BLE001 - any import or bus failure is one refusal
+        _ATSPI_FAILURE = f"AT-SPI2 is unavailable: {exc}"
+        raise HelperError("ACCESSIBILITY_UNAVAILABLE", _ATSPI_FAILURE)
+    _ATSPI = Atspi
+    return _ATSPI
+
+
+def desktop_apps(force=False):
+    Atspi = atspi()
+    now = time.monotonic()
+    if not force and _AT_APPS["apps"] and now - _AT_APPS["at"] < 1.5:
+        return _AT_APPS["apps"]
+    desktop = Atspi.get_desktop(0)
+    apps = []
+    for index in range(desktop.get_child_count()):
+        try:
+            app = desktop.get_child_at_index(index)
+        except Exception:  # noqa: BLE001 - a vanishing accessible is not fatal
+            continue
+        if app is not None:
+            apps.append(app)
+    _AT_APPS["apps"] = apps
+    _AT_APPS["at"] = now
+    return apps
+
+
+def atspi_app(record):
+    """Find the AT-SPI application for a window group.
+
+    Pids are only reliable above the sandbox range, so fall back to the
+    normalized window class, which AT-SPI reports as the application name.
+    """
+    apps = desktop_apps()
+    pid = record.get("pid")
+    if pid is not None and pid > 2:
+        for app in apps:
+            if safe_get(app, "get_process_id", None) == pid:
+                return app
+    wanted = {
+        normalize_label(record.get("label", "")),
+        normalize_label(record.get("className", "")),
+        normalize_label(record.get("name", "")),
+    }
+    wanted.discard("")
+    for app in apps:
+        label = normalize_label(safe_get(app, "get_name", "") or "")
+        if label and any(label == item or item in label or label in item for item in wanted):
+            return app
+    return None
+
+
+def safe_get(obj, method, default=None, *args):
+    try:
+        return getattr(obj, method)(*args)
+    except Exception:  # noqa: BLE001 - unsupported interface or dying accessible
+        return default
+
+
+def accessible_role(accessible):
+    return safe_get(accessible, "get_role_name", "") or ""
+
+
+def accessible_name(accessible):
+    return safe_get(accessible, "get_name", "") or ""
+
+
+def frame_candidates(app):
+    frames = []
+    for index in range(safe_get(app, "get_child_count", 0) or 0):
+        try:
+            child = app.get_child_at_index(index)
+        except Exception:  # noqa: BLE001
+            continue
+        if child is None:
+            continue
+        if accessible_role(child) in _FRAME_ROLES:
+            frames.append(child)
+    return frames
+
+
+def frame_for_window(app, window):
+    frames = frame_candidates(app)
+    if not frames:
+        return None
+    title = window["title"]
+    for frame in frames:
+        if accessible_name(frame) == title:
+            return frame
+    if len(frames) == 1:
+        return frames[0]
+    Atspi = atspi()
+    bounds = window["bounds"]
+    for frame in frames:
+        try:
+            rect = frame.get_extents(Atspi.CoordType.SCREEN)
+        except Exception:  # noqa: BLE001
+            continue
+        if (abs(rect.x - bounds["x"]) <= 2 and abs(rect.y - bounds["y"]) <= 2
+                and abs(rect.width - bounds["width"]) <= 8):
+            return frame
+    return frames[0]
+
+
+def frame_by_title(title):
+    """Last-resort frame lookup: some applications register no app-level accessible."""
+    if not title:
+        return None
+    for app in desktop_apps():
+        for frame in frame_candidates(app):
+            if accessible_name(frame) == title:
+                return frame
+    return None
+
+
+def actions_of(accessible):
+    iface = safe_get(accessible, "get_action_iface")
+    if iface is None:
+        return []
+    names = []
+    for index in range(safe_get(iface, "get_n_actions", 0) or 0):
+        names.append(safe_get(iface, "get_action_name", "", index) or "")
+    return names
+
+
+def text_of(accessible, limit=160):
+    iface = safe_get(accessible, "get_text_iface")
+    if iface is None:
+        return ""
+    count = safe_get(iface, "get_character_count", 0) or 0
+    if count <= 0:
+        return ""
+    try:
+        return iface.get_text(0, min(count, limit)) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def value_of(accessible):
+    iface = safe_get(accessible, "get_value_iface")
+    if iface is None:
+        return None
+    value = safe_get(iface, "get_current_value")
+    if value is None:
+        return None
+    try:
+        return round(float(value), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def element_line(accessible, index, depth, details):
+    role = accessible_role(accessible) or "unknown"
+    name = accessible_name(accessible)
+    parts = [f"[e{index}]", role]
+    if name:
+        parts.append(json.dumps(name[:120], ensure_ascii=False))
+    text = text_of(accessible)
+    if text and text.strip():
+        parts.append("text=" + json.dumps(text[:140], ensure_ascii=False))
+    else:
+        value = value_of(accessible)
+        if value is not None and value != 0:
+            parts.append(f"value={value:g}")
+    actions = actions_of(accessible)
+    if actions:
+        shown = actions[:4]
+        parts.append("actions=[" + ",".join(shown) + ("]" if len(actions) == len(shown) else ",...]"))
+    if details:
+        Atspi = atspi()
+        try:
+            rect = accessible.get_extents(Atspi.CoordType.SCREEN)
+            parts.append(f"bounds={rect.x},{rect.y} {rect.width}x{rect.height}")
+        except Exception:  # noqa: BLE001
+            pass
+    return "  " * depth + " ".join(parts)
+
+
+class TreeWalk:
+    """Bounded AT-SPI projection that also keeps element references by id."""
+
+    def __init__(self, max_elements, max_depth, details):
+        self.max_elements = max_elements
+        self.max_depth = max_depth
+        self.details = details
+        self.lines = []
+        self.elements = []
+        self.truncated = False
+        self.deadline = time.monotonic() + AX_BUDGET_MS / 1000.0
+
+    def visit(self, accessible, depth):
+        if len(self.elements) >= self.max_elements or depth > self.max_depth \
+                or time.monotonic() > self.deadline:
+            self.truncated = True
+            return
+        self.elements.append(accessible)
+        self.lines.append(element_line(accessible, len(self.elements) - 1, depth, self.details))
+        if depth >= self.max_depth:
+            if safe_get(accessible, "get_child_count", 0):
+                self.truncated = True
+            return
+        count = safe_get(accessible, "get_child_count", 0) or 0
+        for index in range(count):
+            if len(self.elements) >= self.max_elements or time.monotonic() > self.deadline:
+                self.truncated = True
+                return
+            try:
+                child = accessible.get_child_at_index(index)
+            except Exception:  # noqa: BLE001
+                continue
+            if child is not None:
+                self.visit(child, depth + 1)
+
+
+_SNAPSHOTS = {}   # (appHandle, windowId) -> {"id", "elements"}
+_SNAPSHOT_ORDER = []
+
+
+def snapshot_store(handle, window_id, elements):
+    snapshot_id = uuid.uuid4().hex
+    scope = (handle, window_id)
+    _SNAPSHOTS[scope] = {"id": snapshot_id, "elements": elements}
+    if scope in _SNAPSHOT_ORDER:
+        _SNAPSHOT_ORDER.remove(scope)
+    _SNAPSHOT_ORDER.append(scope)
+    while len(_SNAPSHOT_ORDER) > 4:
+        stale = _SNAPSHOT_ORDER.pop(0)
+        _SNAPSHOTS.pop(stale, None)
+    return snapshot_id
+
+
+def snapshot_element(params):
+    handle = params["appHandle"]
+    window_id = params.get("windowId")
+    snapshot_id = params.get("snapshotId")
+    element_id = params.get("elementId", "")
+    scope = (handle, window_id)
+    snapshot = _SNAPSHOTS.get(scope)
+    if snapshot is None or snapshot["id"] != snapshot_id:
+        raise HelperError("STALE_SNAPSHOT", "Read fresh state with getState before using element ids")
+    match = re.fullmatch(r"e(\d+)", str(element_id))
+    if match is None:
+        raise HelperError("INVALID_ELEMENT", f"Unrecognized element id {element_id!r}")
+    index = int(match.group(1))
+    if index < 0 or index >= len(snapshot["elements"]):
+        raise HelperError("STALE_ELEMENT", "The element is no longer part of the current observation")
+    return snapshot["elements"][index]
+
+
+def element_center(accessible):
+    Atspi = atspi()
+    rect = accessible.get_extents(Atspi.CoordType.SCREEN)
+    if rect.width <= 0 or rect.height <= 0:
+        raise HelperError("ELEMENT_NOT_VISIBLE", "The element has no on-screen bounds")
+    return rect.x + rect.width // 2, rect.y + rect.height // 2
+
+
+def get_state(params):
+    handle, record = require_handle(params)
+    window_id = params.get("windowId")
+    max_elements = int(params.get("maxElements", 2000))
+    max_depth = int(params.get("maxDepth", 25))
+    details = bool(params.get("details", False))
+    windows = windows_of(record)
+    focused = active_window_id()
+
+    if window_id is None:
+        window = None
+        for candidate in windows:
+            if candidate["windowId"] == focused:
+                window = candidate
+                break
+        window = window or (windows[0] if windows else None)
+    else:
+        window = find_window(handle, window_id)
+
+    if window is None:
+        raise HelperError("WINDOW_NOT_FOUND", "The application has no managed window to observe")
+
+    frame = None
+    app = atspi_app(record)
+    if app is not None:
+        frame = frame_for_window(app, window)
+    if frame is None:
+        frame = frame_by_title(window["title"])
+    if frame is None:
+        tree = (
+            f"# window {window['windowId']} {json.dumps(window['title'], ensure_ascii=False)} "
+            f"{window['bounds']['width']}x{window['bounds']['height']} "
+            f"@{window['bounds']['x']},{window['bounds']['y']}\n"
+            "# This application exposes no AT-SPI tree; use screenshot and window coordinates.\n"
+        )
+        elements = []
+        truncated = False
+    else:
+        walk = TreeWalk(max_elements, max_depth, details)
+        walk.visit(frame, 0)
+        header = (
+            f"# window {window['windowId']} {json.dumps(window['title'], ensure_ascii=False)} "
+            f"{window['bounds']['width']}x{window['bounds']['height']} "
+            f"@{window['bounds']['x']},{window['bounds']['y']}\n"
+        )
+        tree = header + "\n".join(walk.lines)
+        if walk.truncated:
+            tree += f"\n# truncated after {len(walk.elements)} elements; lower maxDepth or raise maxElements"
+        elements = walk.elements
+        truncated = walk.truncated
+
+    snapshot_id = snapshot_store(handle, window["windowId"], elements)
+    own_ids = {item["windowId"] for item in windows}
+    return {
+        "appHandle": handle,
+        "windowId": window["windowId"],
+        "focusedWindowId": focused if focused in own_ids else None,
+        "snapshotId": snapshot_id,
+        "tree": tree,
+        "windows": [public_window(item) for item in windows],
+        "truncated": truncated,
+    }
+
+
+# --------------------------------------------------------------------------
+# pointer and keyboard input
+# --------------------------------------------------------------------------
+
+BUTTONS = {"left": 1, "middle": 2, "right": 3}
+MODIFIERS = {"command": "super", "control": "ctrl", "option": "alt", "shift": "shift", "fn": ""}
+KEY_ALIASES = {
+    "return": "Return", "enter": "Return", "escape": "Escape", "esc": "Escape",
+    "tab": "Tab", "space": "space", "backspace": "BackSpace", "delete": "Delete",
+    "arrowup": "Up", "arrowdown": "Down", "arrowleft": "Left", "arrowright": "Right",
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "home": "Home", "end": "End", "pageup": "Prior", "pagedown": "Next",
+    "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4", "f5": "F5", "f6": "F6",
+    "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
+}
+
+
+def key_name(name):
+    name = str(name).strip()
+    lowered = name.lower()
+    if lowered in KEY_ALIASES:
+        return KEY_ALIASES[lowered]
+    if len(name) == 1:
+        return name
+    return name
+
+
+def key_chord(key, modifiers):
+    parts = []
+    for modifier in modifiers or []:
+        mapped = MODIFIERS.get(str(modifier).lower(), "")
+        if mapped:
+            parts.append(mapped)
+    parts.append(key_name(key))
+    return "+".join(parts)
+
+
+def window_origin(handle, window_id):
+    window = find_window(handle, window_id)
+    return window, window["bounds"]["x"], window["bounds"]["y"], window["bounds"]["width"], window["bounds"]["height"]
+
+
+def target_point(params, handle):
+    window, origin_x, origin_y, _, _ = window_origin(handle, params.get("windowId"))
+    if "elementId" in params:
+        accessible = snapshot_element(params)
+        x, y = element_center(accessible)
+        return window, x, y
+    if "x" not in params or "y" not in params:
+        raise HelperError("INVALID_ARGUMENT", "Provide elementId or x/y coordinates")
+    return window, origin_x + int(params["x"]), origin_y + int(params["y"])
+
+
+def activate_window(window):
+    xdo("windowactivate", "--sync", window["windowId"], timeout=6.0)
+
+
+def foreground_snapshot():
+    active = active_window_id()
+    return active
+
+
+def mouse_move(params):
+    handle = params["appHandle"]
+    window, x, y = target_point(params, handle)
+    xdo("mousemove", "--sync", x, y)
+    return {"dispatched": True, "hoverRoute": "system-pointer", "systemPointerMoved": True}
+
+
+def click(params):
+    handle = params["appHandle"]
+    window, x, y = target_point(params, handle)
+    button = BUTTONS.get(str(params.get("mouseButton", "left")).lower(), 1)
+    count = int(params.get("clickCount", 1) or 1)
+    hold = int(params.get("holdMs", 0) or 0)
+    before = foreground_snapshot()
+    xdo("mousemove", "--sync", x, y, timeout=6.0)
+    if hold > 0:
+        xdo("mousedown", button)
+        time.sleep(min(hold, 5000) / 1000.0)
+        xdo("mouseup", button)
+    else:
+        xdo("click", "--repeat", max(1, count), "--delay", 80, button)
+    after = foreground_snapshot()
+    return {"dispatched": True, "foregroundChanged": before != after}
+
+
+def drag(params):
+    handle = params["appHandle"]
+    window, origin_x, origin_y, _, _ = window_origin(handle, params.get("windowId"))
+    from_x = origin_x + int(params["fromX"])
+    from_y = origin_y + int(params["fromY"])
+    to_x = origin_x + int(params["toX"])
+    to_y = origin_y + int(params["toY"])
+    steps = max(1, int(params.get("steps", 20)))
+    duration = max(1, int(params.get("durationMs", 400)))
+    button = BUTTONS.get(str(params.get("mouseButton", "left")).lower(), 1)
+    xdo("mousemove", "--sync", from_x, from_y)
+    xdo("mousedown", button)
+    pause = duration / steps / 1000.0
+    try:
+        for step in range(1, steps + 1):
+            xdo("mousemove", "--sync",
+                round(from_x + (to_x - from_x) * step / steps),
+                round(from_y + (to_y - from_y) * step / steps))
+            time.sleep(pause)
+    finally:
+        xdo("mouseup", button)
+    return {"dispatched": True}
+
+
+def scroll(params):
+    handle = params["appHandle"]
+    _, x, y = target_point(params, handle)
+    delta_y = int(params.get("deltaLinesY", 0) or 0)
+    delta_x = int(params.get("deltaLinesX", 0) or 0)
+    xdo("mousemove", "--sync", x, y)
+    vertical_button = 5 if delta_y > 0 else 4
+    horizontal_button = 7 if delta_x > 0 else 6
+    if delta_y:
+        xdo("click", "--repeat", min(abs(delta_y), 20), "--delay", 30, vertical_button)
+    if delta_x:
+        xdo("click", "--repeat", min(abs(delta_x), 20), "--delay", 30, horizontal_button)
+    return {"dispatched": True}
+
+
+def focus_for_keyboard(params, handle):
+    window_id = params.get("windowId")
+    if window_id is None:
+        return
+    window = find_window(handle, window_id)
+    activate_window(window)
+
+
+def type_text(params):
+    handle = params["appHandle"]
+    focus_for_keyboard(params, handle)
+    text = str(params.get("text", ""))
+    if not text:
+        return {"dispatched": True}
+    path = os.path.join(CAPTURE_DIR, f"type-{uuid.uuid4().hex}.txt")
+    Path(path).write_text(text, encoding="utf-8")
+    try:
+        xdo("type", "--clearmodifiers", "--delay", TEXT_DELAY_MS, "--file", path, timeout=60.0)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return {"dispatched": True}
+
+
+def press_key(params):
+    handle = params["appHandle"]
+    focus_for_keyboard(params, handle)
+    chord = key_chord(params["key"], params.get("modifiers"))
+    xdo("key", "--clearmodifiers", chord, timeout=10.0)
+    return {"dispatched": True}
+
+
+def send_key_event(params):
+    handle = params["appHandle"]
+    focus_for_keyboard(params, handle)
+    direction = "keydown" if params.get("direction") == "down" else "keyup"
+    xdo(direction, key_name(params["key"]))
+    return {"dispatched": True}
+
+
+def paste_text(params):
+    handle = params["appHandle"]
+    focus_for_keyboard(params, handle)
+    text = str(params.get("text", ""))
+    if not has_binary("xclip"):
+        raise HelperError("NATIVE_UNAVAILABLE", "xclip is required for paste")
+    proc = subprocess.run(["xclip", "-selection", "clipboard", "-i"], input=text.encode("utf-8"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8.0)
+    if proc.returncode != 0:
+        raise HelperError("NATIVE_FAILURE", f"xclip failed: {proc.stderr.decode('utf-8', 'replace')[:200]}")
+    time.sleep(0.05)
+    xdo("key", "--clearmodifiers", "ctrl+v")
+    return {"dispatched": True}
+
+
+# --------------------------------------------------------------------------
+# element operations
+# --------------------------------------------------------------------------
+
+def action_iface(accessible):
+    return safe_get(accessible, "get_action_iface")
+
+
+def perform_named_action(accessible, action):
+    iface = action_iface(accessible)
+    if iface is None:
+        return False
+    for index in range(safe_get(iface, "get_n_actions", 0) or 0):
+        name = safe_get(iface, "get_action_name", "", index) or ""
+        if name.lower() == action.lower():
+            return _do_action(iface, index)
+    return False
+
+
+def _do_action(iface, index):
+    try:
+        iface.do_action(index)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def list_actions(params):
+    accessible = snapshot_element(params)
+    return actions_of(accessible)
+
+
+def perform_action(params):
+    accessible = snapshot_element(params)
+    return {"dispatched": perform_named_action(accessible, str(params.get("action", "")))}
+
+
+def invoke(params):
+    accessible = snapshot_element(params)
+    names = actions_of(accessible)
+    preferred = ["click", "press", "activate", "open", "default"]
+    for name in preferred:
+        if name in [item.lower() for item in names]:
+            return {"dispatched": perform_named_action(accessible, name)}
+    iface = action_iface(accessible)
+    if iface is not None and (safe_get(iface, "get_n_actions", 0) or 0) > 0:
+        return {"dispatched": _do_action(iface, 0)}
+    return {"dispatched": False}
+
+
+def set_value(params):
+    accessible = snapshot_element(params)
+    value = params.get("value")
+    if isinstance(value, (dict, list)):
+        raise HelperError("INVALID_ARGUMENT", "setValue accepts a string or a number")
+    editable = safe_get(accessible, "get_editable_text_iface")
+    if editable is not None:
+        try:
+            editable.set_text_contents(str(value))
+            return {"dispatched": True}
+        except Exception:  # noqa: BLE001
+            pass
+    value_iface = safe_get(accessible, "get_value_iface")
+    if value_iface is not None:
+        try:
+            value_iface.set_current_value(float(value))
+            return {"dispatched": True}
+        except Exception:  # noqa: BLE001
+            pass
+    return {"dispatched": False}
+
+
+def select_text(params):
+    accessible = snapshot_element(params)
+    iface = safe_get(accessible, "get_text_iface")
+    if iface is None:
+        return {"dispatched": False}
+    content = text_of(accessible, limit=20000)
+    needle = str(params.get("text", ""))
+    prefix = params.get("prefix")
+    suffix = params.get("suffix")
+    start = content.find(needle) if needle else 0
+    if start < 0:
+        return {"dispatched": False}
+    if prefix:
+        anchor = content.rfind(prefix, 0, start + 1)
+        if anchor >= 0:
+            start = anchor + len(prefix)
+    end = start + len(needle)
+    selection_type = params.get("selectionType", "text")
+    if selection_type == "cursor_before":
+        end = start
+    elif selection_type == "cursor_after":
+        start = end
+    try:
+        if hasattr(iface, "add_selection"):
+            iface.add_selection(start, end)
+        else:
+            return {"dispatched": False}
+    except Exception:  # noqa: BLE001
+        return {"dispatched": False}
+    return {"dispatched": True}
+
+
+def click_element(params):
+    accessible = snapshot_element(params)
+    names = actions_of(accessible)
+    for name in ["click", "press", "activate"]:
+        if name in [item.lower() for item in names] and perform_named_action(accessible, name):
+            return {"dispatched": True}
+    x, y = element_center(accessible)
+    xdo("mousemove", "--sync", x, y, timeout=6.0)
+    xdo("click", "--repeat", max(1, int(params.get("clickCount", 1) or 1)), "--delay", 80,
+        BUTTONS.get(str(params.get("mouseButton", "left")).lower(), 1))
+    return {"dispatched": True}
+
+
+# --------------------------------------------------------------------------
+# application chrome
+# --------------------------------------------------------------------------
+
+def activate(params):
+    handle, record = require_handle(params)
+    windows = windows_of(record)
+    if not windows:
+        raise HelperError("WINDOW_NOT_FOUND", "The application has no managed window")
+    before = foreground_snapshot()
+    activate_window(windows[0])
+    after = foreground_snapshot()
+    return {"dispatched": True, "foregroundChanged": before != after}
+
+
+def show(params):
+    handle = params["appHandle"]
+    window = find_window(handle, params.get("windowId"))
+    before = foreground_snapshot()
+    xdo("windowmap", window["windowId"], timeout=6.0)
+    xdo("windowraise", window["windowId"], timeout=6.0)
+    try:
+        activate_window(window)
+    except HelperError:
+        pass
+    after = foreground_snapshot()
+    return {"dispatched": True, "windowId": window["windowId"], "foregroundChanged": before != after}
+
+
+# --------------------------------------------------------------------------
+# screenshots
+# --------------------------------------------------------------------------
+
+def png_size(data):
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise HelperError("SCREENSHOT_FAILED", "Capture did not produce a PNG image")
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
+
+
+def screenshot(params):
+    handle, record = require_handle(params)
+    window = find_window(handle, params["windowId"])
+    path = os.path.join(CAPTURE_DIR, f"shot-{uuid.uuid4().hex}.png")
+    errors = []
+    for argv in (["maim", "-i", str(window["windowId"]), path],
+                 ["import", "-window", str(window["windowId"]), path]):
+        if not has_binary(argv[0]):
+            errors.append(f"{argv[0]} is not installed")
+            continue
+        try:
+            run(argv, timeout=10.0)
+            data = Path(path).read_bytes()
+            break
+        except (HelperError, OSError) as exc:
+            errors.append(str(exc))
+            data = None
+    else:
+        data = None
+    try:
+        if not data:
+            raise HelperError("SCREENSHOT_FAILED", "No capture backend succeeded: " + "; ".join(errors[:3]))
+        width, height = png_size(data)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return {
+        "mimeType": "image/png",
+        "data": base64.b64encode(data).decode("ascii"),
+        "pixelWidth": width,
+        "pixelHeight": height,
+        "windowId": window["windowId"],
+        "bounds": window["bounds"],
+        "coordinateSpace": "window-pixels",
+    }
+
+
+# --------------------------------------------------------------------------
+# capabilities and permission chrome
+# --------------------------------------------------------------------------
+
+def capabilities():
+    try:
+        atspi()
+        accessible = True
+    except HelperError:
+        accessible = False
+    capture = has_binary("maim") or has_binary("import")
+    return {
+        "platform": "linux-x11",
+        "permissions": {"accessibility": accessible, "screenRecording": capture},
+        "appLevelAccessibility": True,
+        "systemPointer": True,
+        "keyboard": ["app", "window"],
+        "sessionLocked": session_locked(),
+        "methods": list(METHODS),
+        "coordinateSpace": "screenshot-pixels",
+        "browser": False,
+    }
+
+
+def permission_status():
+    # The Host parses macOS/Windows shapes only; this reply is informational.
+    return {
+        "platform": "linux",
+        "permissions": capabilities()["permissions"],
+        "helper": {"pid": os.getpid()},
+    }
+
+
+def request_permission(params):
+    return permission_status()
+
+
+def open_permission_settings(params):
+    return {"opened": True}
+
+
+def application_icons(params):
+    # Theme icon extraction needs a PNG rasteriser; report no icons and let the UI fall back.
+    return {}
+
+
+# --------------------------------------------------------------------------
+# protocol dispatcher
+# --------------------------------------------------------------------------
+
+HANDLERS = {
+    "getCapabilities": lambda params: capabilities(),
+    "listApps": lambda params: list_apps(),
+    "findApps": lambda params: find_apps(params["query"], int(params.get("maxAppMatches", 20))),
+    "getApp": get_app,
+    "launchApp": launch_app,
+    "activate": activate,
+    "show": show,
+    "listWindows": list_windows,
+    "getState": get_state,
+    "listActions": list_actions,
+    "performAction": perform_action,
+    "invoke": invoke,
+    "setValue": set_value,
+    "selectText": select_text,
+    "mouseMove": mouse_move,
+    "click": lambda params: click_element(params) if "elementId" in params else click(params),
+    "drag": drag,
+    "scroll": scroll,
+    "typeText": type_text,
+    "pressKey": press_key,
+    "sendKeyEvent": send_key_event,
+    "paste": paste_text,
+    "screenshot": screenshot,
+    "permissionStatus": lambda params: permission_status(),
+    "requestPermission": request_permission,
+    "openPermissionSettings": open_permission_settings,
+    "applicationIcons": application_icons,
+}
+
+
+def dispatch(method, params):
+    handler = HANDLERS.get(method)
+    if handler is None:
+        raise HelperError("NATIVE_UNSUPPORTED", f"Unknown method {method}")
+    return handler(params or {})
+
+
+def selftest():
+    report = {"capabilities": capabilities()}
+    try:
+        report["apps"] = list_apps()
+        report["findApps"] = find_apps("terminal", 5)
+        windows = managed_window_ids()
+        report["windows"] = [public_window(window_record(window_id)) for window_id in windows[:5]]
+        if windows:
+            props = window_props(windows[0])
+            report["firstWindowPid"] = props["pid"]
+            report["sessionLocked"] = session_locked()
+    except HelperError as exc:
+        report["error"] = f"{exc.code}: {exc.message}"
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+def main():
+    if "--selftest" in sys.argv:
+        return selftest()
+
+    output = sys.stdout.buffer
+    write_lock = threading.Lock()
+    finished = set()
+    cancelled = set()
+    pending = queue.Queue()
+
+    def send(payload):
+        with write_lock:
+            output.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            output.flush()
+
+    def reader():
+        try:
+            for raw in sys.stdin.buffer:
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    pending.put(line)
+        except Exception:  # noqa: BLE001 - stdin closed is a normal shutdown
+            pass
+        pending.put(None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    while True:
+        line = pending.get()
+        if line is None:
+            return 0
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("type") == "cancel":
+            request_id = message.get("id")
+            with write_lock:
+                if request_id in finished:
+                    continue
+                finished.add(request_id)
+                cancelled.add(request_id)
+                output.write((json.dumps({
+                    "id": request_id,
+                    "error": {"code": "NATIVE_CANCELLED", "message": "Native operation was cancelled"},
+                }) + "\n").encode("utf-8"))
+                output.flush()
+            continue
+        request_id = message.get("id")
+        method = message.get("method")
+        try:
+            result = dispatch(method, message.get("params") or {})
+            reply = {"id": request_id, "result": result}
+        except HelperError as exc:
+            reply = {"id": request_id, "error": {"code": exc.code, "message": exc.message}}
+        except Exception as exc:  # noqa: BLE001 - never lose the request
+            reply = {"id": request_id, "error": {"code": "NATIVE_FAILURE", "message": f"{type(exc).__name__}: {exc}"}}
+        with write_lock:
+            if request_id in finished:
+                continue
+            finished.add(request_id)
+            output.write((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
+            output.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

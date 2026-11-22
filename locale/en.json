@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "X11 computer use",
+    "description": "Gives the agent one cua tool for the local X11 desktop: list windows, read the accessibility tree, capture a window, and dispatch clicks, keys and text. Linux X11 only; needs xdotool and maim, and uses AT-SPI2 for accessibility.",
+    "detail": "docs/DETAIL.md"
+  }
+}
