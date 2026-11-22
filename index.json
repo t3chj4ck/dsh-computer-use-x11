@@ -1,0 +1,68 @@
+{
+  "format": 1,
+  "title": {
+    "en": "WU HAOJIE's DSH plugins",
+    "zh": "WU HAOJIE 的 DSH 插件"
+  },
+  "description": {
+    "en": "Plugins maintained by t3chj4ck for DeepSeek Harness.",
+    "zh": "t3chj4ck 维护的 DeepSeek Harness 插件。"
+  },
+  "metadata": {
+    "categories": {
+      "desktop": {
+        "title": {
+          "en": "Desktop",
+          "zh": "桌面操作"
+        }
+      }
+    },
+    "labels": {},
+    "sortKeys": {}
+  },
+  "plugins": [
+    {
+      "name": "dsh-computer-use-x11",
+      "title": {
+        "en": "X11 computer use",
+        "zh": "X11 电脑操作"
+      },
+      "description": {
+        "en": "Computer Use provider for Linux X11: one cua tool for windows, accessibility, screenshots, clicks, keys and text.",
+        "zh": "Linux X11 的电脑操作后端：一个 cua 工具负责窗口、无障碍树、截图、点击、按键和文本。"
+      },
+      "icon": "icon.svg",
+      "author": "WU HAOJIE",
+      "homepage": "https://github.com/t3chj4ck/dsh-computer-use-x11",
+      "repository": {
+        "url": "https://github.com/t3chj4ck/dsh-computer-use-x11"
+      },
+      "metadata": {
+        "category": "desktop",
+        "keywords": [
+          "computer-use",
+          "x11",
+          "linux",
+          "at-spi",
+          "xdotool",
+          "automation"
+        ],
+        "labels": []
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1795379303,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/t3chj4ck/dsh-computer-use-x11.git",
+            "commit": "aa18f82389c593c2effcba18a363365468b8f0c0"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.1"
+          }
+        }
+      ]
+    }
+  ]
+}
