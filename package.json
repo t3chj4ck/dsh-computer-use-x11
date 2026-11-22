@@ -1,5 +1,5 @@
 {
-  "name": "computer-use-x11",
+  "name": "dsh-computer-use-x11",
   "version": "0.1.0",
   "description": "Computer Use provider for Linux X11: windows, accessibility, screenshots and input through the shared cua tool",
   "type": "module",
@@ -40,8 +40,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/t3chj4ck/computer-use-x11.git"
+    "url": "git+https://github.com/t3chj4ck/dsh-computer-use-x11.git"
   },
-  "homepage": "https://github.com/t3chj4ck/computer-use-x11#readme",
+  "homepage": "https://github.com/t3chj4ck/dsh-computer-use-x11#readme",
   "author": "WU HAOJIE"
 }

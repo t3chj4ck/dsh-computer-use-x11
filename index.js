@@ -9,7 +9,7 @@ import { CuaConfigFields } from '@deepseek-ai/dsh-cua/config'
 import { COMMON_GUIDANCE } from '@deepseek-ai/dsh-cua/guidance'
 
 /** Loader plugin identity. */
-const name = 'computer-use-x11'
+const name = 'dsh-computer-use-x11'
 /** Services required by the shared CUA executor and the native launcher. */
 const inject = ['computerUse', 'tools', 'systemPrompt', 'subprocess', 'agents']
 
