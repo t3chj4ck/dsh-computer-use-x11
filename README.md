@@ -48,6 +48,17 @@ The model gets one tool, `cua`, dispatched by `method`:
 
 Selecting an application asks for consent through the shared CUA application approval, unless the profile's approval policy already allows it.
 
+## Operating etiquette
+
+The plugin tells the model to classify the desktop once with a shell command before it sends any input:
+
+```sh
+printf 'desktop=%s session=%s\n' "${XDG_CURRENT_DESKTOP:-unset}" "${DESKTOP_SESSION:-unset}"
+xprop -root _NET_SUPPORTING_WM_CHECK _NET_WM_NAME
+```
+
+It then has to state whether this is a bare window manager (i3, bspwm, dwm, openbox) or a full desktop (GNOME, Plasma, XFCE), and agree with you on what you may do meanwhile: watching is fine, but moving the pointer, switching workspace, changing focus or locking the screen invalidates the frame the next click relies on. `show` and `activate` are the only calls that change what you see.
+
 ## Limitations
 
 - **X11 only.** No global input injection or window enumeration exists on Wayland. The bundle row disables itself on non-Linux hosts and when `DISPLAY` is unset, so installing it elsewhere does nothing instead of erroring.
