@@ -28,8 +28,8 @@
         "zh": "X11 电脑操作"
       },
       "description": {
-        "en": "Computer Use provider for Linux X11: one cua tool for windows, accessibility, screenshots, clicks, keys and text.",
-        "zh": "Linux X11 的电脑操作后端：一个 cua 工具负责窗口、无障碍树、截图、点击、按键和文本。"
+        "en": "Computer Use provider for Linux X11: one cua tool for windows, accessibility, screenshots, clicks, keys and text. Skips itself on other hosts.",
+        "zh": "Linux X11 的电脑操作后端：一个 cua 工具负责窗口、无障碍树、截图、点击、按键和文本；非 Linux 主机会自动跳过。"
       },
       "icon": "icon.svg",
       "author": "WU HAOJIE",
@@ -51,12 +51,12 @@
       },
       "versions": [
         {
-          "version": "0.1.0",
-          "publishTimestamp": 1795379303,
+          "version": "0.1.1",
+          "publishTimestamp": 1795379941,
           "source": {
             "type": "git",
             "url": "https://github.com/t3chj4ck/dsh-computer-use-x11.git",
-            "commit": "aa18f82389c593c2effcba18a363365468b8f0c0"
+            "commit": "ea56ec5c88f5cabf5d793e9568a524def224c90a"
           },
           "engines": {
             "dsh": ">=0.2.2-rc.1"
