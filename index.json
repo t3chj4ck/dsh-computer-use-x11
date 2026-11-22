@@ -51,12 +51,12 @@
       },
       "versions": [
         {
-          "version": "0.2.0",
-          "publishTimestamp": 1795380231,
+          "version": "0.2.1",
+          "publishTimestamp": 1795380278,
           "source": {
             "type": "git",
             "url": "https://github.com/t3chj4ck/dsh-computer-use-x11.git",
-            "commit": "fe155462fb9e82c34332d053f5f6a52ac31fec39"
+            "commit": "e17e38e3e7a4bdec6c42e4e83636cdd90ed90d10"
           },
           "engines": {
             "dsh": ">=0.2.2-rc.1"
