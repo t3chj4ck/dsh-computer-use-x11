@@ -43,7 +43,7 @@ const PLATFORM_GUIDANCE = `Linux X11: accessibility tree operations work at app 
 
 /** Desktop-session etiquette the model must settle with the user before dispatching input. */
 const SESSION_GUIDANCE = `Before dispatching the first click or keystroke of a session, classify the desktop once with a shell command, for example:
-  printf 'desktop=%s session=%s\n' "\${XDG_CURRENT_DESKTOP:-unset}" "\${DESKTOP_SESSION:-unset}"; xprop -root _NET_SUPPORTING_WM_CHECK _NET_WM_NAME
+  printf 'desktop=%s session=%s\\n' "\${XDG_CURRENT_DESKTOP:-unset}" "\${DESKTOP_SESSION:-unset}"; xprop -root _NET_SUPPORTING_WM_CHECK _NET_WM_NAME
 A bare window manager (i3, sway, bspwm, dwm, awesome, openbox, xmonad) switches workspaces by moving windows off the screen and imposes no session-wide focus policy; a full desktop (GNOME, KDE Plasma, XFCE, Cinnamon) adds overview screens, notifications and screen locking that can take focus away. Say which one the machine runs, then agree with the user once, in their language, on what they may do while input is being dispatched: watching is fine; moving the pointer, switching workspace or virtual desktop, changing focus, locking the screen, or dragging the target window invalidates the screenshot or snapshot that the next click and keystroke rely on, and typed text goes wherever focus moved. Ask them to say so when they need to take over, and after any interference read fresh state instead of replaying the previous input. show and activate are the only operations that may pull a window back into view; both change what the user sees and which workspace they are on, so mention it before using them.`
 
 /** Native operation instructions; the shared Host adds guidance for declared capabilities. */

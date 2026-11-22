@@ -1,6 +1,6 @@
 {
   "name": "dsh-computer-use-x11",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Computer Use provider for Linux X11: windows, accessibility, screenshots and input through the shared cua tool",
   "type": "module",
   "main": "index.js",
