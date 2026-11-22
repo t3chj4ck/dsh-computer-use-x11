@@ -50,7 +50,7 @@ Selecting an application asks for consent through the shared CUA application app
 
 ## Limitations
 
-- **X11 only.** No global input injection or window enumeration exists on Wayland.
+- **X11 only.** No global input injection or window enumeration exists on Wayland. The bundle row disables itself on non-Linux hosts and when `DISPLAY` is unset, so installing it elsewhere does nothing instead of erroring.
 - **Accessibility coverage is uneven.** Terminals (kitty), Chromium/Electron without renderer accessibility, and Qt without `QT_LINUX_ACCESSIBILITY_ALWAYS_ON` expose no tree. Fall back to a screenshot plus window-local pixel clicks.
 - The helper asks at-spi2-core to expose UI trees (`org.a11y.Status.IsEnabled=true`); already-running applications may need a restart. Set `DSH_X11_ENABLE_A11Y=0` to disable.
 - Applications are grouped by `WM_CLASS` instance, not pid: processes started inside a sandbox report a namespace-local pid, so pid alone can collide.

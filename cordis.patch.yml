@@ -1,5 +1,7 @@
 - insert:
     - id: cua-provider-registry
       name: '@deepseek-ai/dsh-computer-use'
+    # X11 backends are host-specific: skip the provider where it cannot work.
     - id: dsh-computer-use-x11
       name: 'dsh-computer-use-x11'
+      disabled: !!js process.platform !== 'linux' || !process.env.DISPLAY
